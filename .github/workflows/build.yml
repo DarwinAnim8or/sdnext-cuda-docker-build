@@ -1,14 +1,80 @@
 name: Build SD.Next CUDA
 
 on:
+  schedule:
+    # Poll upstream once a day (04:17 UTC); the check job exits early if nothing changed.
+    - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this upstream commit is already published"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   packages: write
 
+# Never run two builds at once; a newer trigger waits for the current one.
+concurrency:
+  group: sdnext-cuda-build
+  cancel-in-progress: false
+
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      full_sha: ${{ steps.upstream.outputs.full_sha }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - name: Get upstream master commit
+        id: upstream
+        shell: bash
+        run: |
+          FULL_SHA="$(git ls-remote https://github.com/vladmandic/sdnext.git refs/heads/master | cut -f1)"
+          if [ -z "$FULL_SHA" ]; then
+            echo "Could not resolve upstream master" >&2
+            exit 1
+          fi
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Upstream master: $FULL_SHA"
+
+      - name: Lowercase GHCR owner
+        id: image
+        shell: bash
+        run: |
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${OWNER}/sdnext-cuda" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to build
+        id: decide
+        shell: bash
+        run: |
+          TAG="${{ steps.image.outputs.name }}:master-${{ steps.upstream.outputs.sha }}"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Forced rebuild."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect "$TAG" > /dev/null 2>&1; then
+            echo "$TAG already exists, nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG not found, building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -25,28 +91,15 @@ jobs:
           docker system prune -af || true
           df -h
 
+      # Pin to the exact commit the check job saw, so the tag always matches the contents
+      # even if upstream pushes again mid-run.
       - name: Checkout SD.Next
         uses: actions/checkout@v6
         with:
           repository: vladmandic/sdnext
-          ref: master
+          ref: ${{ needs.check.outputs.full_sha }}
           path: sdnext
           fetch-depth: 1
-
-      - name: Get SD.Next commit
-        id: version
-        working-directory: sdnext
-        shell: bash
-        run: |
-          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "full_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Lowercase GHCR owner
-        id: image
-        shell: bash
-        run: |
-          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          echo "name=ghcr.io/${OWNER}/sdnext-cuda" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -65,16 +118,19 @@ jobs:
           file: ./sdnext/configs/Dockerfile.cuda
           push: true
           tags: |
-            ${{ steps.image.outputs.name }}:master
-            ${{ steps.image.outputs.name }}:master-${{ steps.version.outputs.sha }}
+            ${{ needs.check.outputs.image }}:master
+            ${{ needs.check.outputs.image }}:master-${{ needs.check.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.full_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Summary
         run: |
-          echo "### Built SD.Next" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Built SD.Next ${{ needs.check.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.image.outputs.name }}:master" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.image.outputs.name }}:master-${{ steps.version.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ needs.check.outputs.image }}:master" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ needs.check.outputs.image }}:master-${{ needs.check.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
